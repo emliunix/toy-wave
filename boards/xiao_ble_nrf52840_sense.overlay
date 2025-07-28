@@ -1,0 +1,24 @@
+dmic_dev: &pdm0 {
+    status = "okay";
+};
+
+&usbd {
+    num-isoin-endpoints = <0x02>;
+    mic_dev: usb-audio-mic {
+        compatible = "usb-audio-mic";
+        channel-l;
+        feature-mute;
+        feature-volume;
+        resolution = <16>;
+        sample-rate-hz = <16000>;
+    };
+};
+
+pdm_mic_regulator: &{/msm261d3526hicpm-c-en} {
+    regulator-boot-on;
+};
+
+&{/chosen} {
+    zephyr,console = &xiao_serial;
+    zephyr,shell-uart = &board_cdc_acm_uart;
+};
