@@ -2,6 +2,10 @@ dmic_dev: &pdm0 {
     status = "okay";
 };
 
+pdm_mic_regulator: &{/msm261d3526hicpm-c-en} {
+    regulator-boot-on;
+};
+
 &usbd {
     num-isoin-endpoints = <0x02>;
     mic_dev: usb-audio-mic {
@@ -14,11 +18,22 @@ dmic_dev: &pdm0 {
     };
 };
 
-pdm_mic_regulator: &{/msm261d3526hicpm-c-en} {
-    regulator-boot-on;
-};
-
 &{/chosen} {
     zephyr,console = &xiao_serial;
-    zephyr,shell-uart = &board_cdc_acm_uart;
+    zephyr,shell-uart = &xiao_serial;
+};
+
+&i2c1 {
+    ssd1306: ssd1306@3c {
+        compatible = "solomon,ssd1306fb";
+        reg = <0x3c>;
+        width = <128>;
+        height = <64>;
+        segment-offset = <0>;
+        page-offset = <0>;
+        display-offset = <0>;
+        multiplex-ratio = <63>;
+        prechargep = <0x22>;
+        status = "okay";
+    };
 };

@@ -1,3 +1,6 @@
+#include "arm_math_types.h"
+#include "zephyr/fatal_types.h"
+#include "zephyr/sys/__assert.h"
 #include <zephyr/kernel.h>
 #include <zephyr/net_buf.h>
 #include <zephyr/sys/byteorder.h>
@@ -5,11 +8,14 @@
 #include <zephyr/usb/usb_device.h>
 #include <zephyr/usb/class/usb_audio.h>
 #include <zephyr/drivers/regulator.h>
+#include <zephyr/drivers/display.h>
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(dmic_sample, LOG_LEVEL_DBG);
 
 #include <hal/nrf_pdm.h>
+
+#include <melspec.h>
 
 #include <dsp/statistics_functions.h>
 
@@ -36,8 +42,9 @@ NET_BUF_POOL_DEFINE(audio_buf_pool, 4, MAX_BLOCK_SIZE, 0, NULL);
 
 static const struct device *const usb_audio_mic = DEVICE_DT_GET(DT_NODELABEL(mic_dev));
 static const struct device *const dmic_dev = DEVICE_DT_GET(DT_NODELABEL(dmic_dev));
+static const struct device *const ssd1306_dev = DEVICE_DT_GET(DT_NODELABEL(ssd1306));
 
-static int16_t mic_volume = 100;
+static int16_t  mic_volume = 100;
 static bool     mic_muted  = false;
 static int      data_dropped = 0;
 static int      data_received = 0;
@@ -48,11 +55,13 @@ static int16_t  data_avg = 0;
 static size_t   data_len = 0;
 static int16_t  data_fst = 0;
 
-K_MSGQ_DEFINE(audio_data_msgq, sizeof(struct net_buf*), 1, 1);
+K_MSGQ_DEFINE(audio_data_msgq, sizeof(struct net_buf*), 1, 4);
+K_MSGQ_DEFINE(audio_process_msgq, sizeof(struct net_buf*), 8, 4);
 
 K_SEM_DEFINE(read_pdm_mic_start_sem, 0, 1);
 
 void stats_buffer(void *buffer, size_t len, int16_t *min, int16_t *max, int16_t *avg);
+void audio_mel_on_data(int16_t *data, size_t data_size);
 
 void read_pdm_mic_thread_func() {
     k_sem_take(&read_pdm_mic_start_sem, K_FOREVER);
@@ -74,17 +83,18 @@ void read_pdm_mic_thread_func() {
             LOG_ERR("Failed to read audio data: %d", ret);
             break;
         }
+        // stats
         data_len = buffer_size;
         data_fst = UNALIGNED_GET((int16_t *)buffer);
         stats_buffer(buffer, buffer_size, &data_min, &data_max, &data_avg);
         data_received++;
+        // send usb mic data
         data = net_buf_alloc(&audio_buf_pool, K_NO_WAIT);
         if (!data) {
             LOG_ERR("Failed to allocate audio buffer");
             break;
         }
         net_buf_add_mem(data, buffer, buffer_size);
-        k_mem_slab_free(&mem_slab, buffer);
 
         while (k_msgq_put(&audio_data_msgq, &data, K_NO_WAIT) != 0) {
             struct net_buf *old = NULL;
@@ -94,6 +104,9 @@ void read_pdm_mic_thread_func() {
                 data_dropped++;
             }
         }
+        // send mel spec processing data
+        audio_mel_on_data(buffer, buffer_size / sizeof(int16_t));
+        k_mem_slab_free(&mem_slab, buffer);
     }
 }
 
@@ -109,7 +122,131 @@ void print_stats_thread_func() {
 }
 
 K_THREAD_DEFINE(print_stats_thread, 512, print_stats_thread_func, NULL, NULL, NULL,
-                    K_PRIO_PREEMPT(7), 0, 0);
+                    K_PRIO_PREEMPT(8), 0, 0);
+
+static melspec_t mel;
+static float32_t mel_buf[1024 + 256];
+// 8 * 128 * 8
+// 8 pages, 128 columns per page, 8 bits(rows) per column
+static uint8_t mel_pixbuf[8*128];
+
+K_MUTEX_DEFINE(audio_mel_mutex);
+K_SEM_DEFINE(audio_process_sem, 0, 1);
+
+void audio_mel_on_data(int16_t *data, size_t data_size) {
+  if (k_sem_count_get(&audio_process_sem) < 1) {
+    k_mutex_lock(&audio_mel_mutex, K_FOREVER);
+    melspec_put(&mel, data, data_size);
+    k_mutex_unlock(&audio_mel_mutex);
+    k_sem_give(&audio_process_sem);
+  } else {
+    // drop on busy
+    /* LOG_WRN("Busy melspec processing, dropping data"); */
+  }
+}
+
+static uint8_t pix_lut[] = { 0x00, 0x80, 0xC0, 0xE0, 0xF0, 0xF8, 0xFC, 0xFE, 0xFF };
+
+void render(uint8_t* pixbuf, int* bars) {
+  memset(pixbuf, 0, 8 * 128);
+  for (int i = 0; i < 32; i++) {
+    int b = bars[i];
+    b = b < 0 ? 0 : (b > 64 ? 64 : b);
+    // full byte
+    for (int j = 0; j < b / 8; j++) {
+      size_t base_idx = (8 - 1 - j) * 128;
+      /* LOG_DBG("bar %d, row %d, base_idx %zu", i, j, base_idx); */
+      for (int x = i * 4; x < (i + 1) * 4; x++) {
+         size_t idx = base_idx + x;
+        __ASSERT_NO_MSG(idx >= 0 && idx < 8 * 128);
+        pixbuf[idx] = 0xFF;
+      }
+    }
+    if (b % 8 > 0) {
+      // last row
+      size_t base_idx = (8 - 1 - b / 8) * 128;
+      /* LOG_DBG("bar %d, row %d, base_idx %zu", i, b / 8, base_idx); */
+      for (int x = i * 4; x < (i + 1) * 4; x++) {
+        size_t idx = base_idx + x;
+        __ASSERT_NO_MSG(idx >= 0 && idx < 8 * 128);
+        pixbuf[idx] = pix_lut[b % 8];
+      }
+    }
+  }
+}
+
+void draw(uint8_t* pixbuf) {
+  struct display_buffer_descriptor desc = {
+    .buf_size = 128,
+    .width = 128,
+    .height = 8,
+    .pitch = 128,
+  };
+  for (int j = 0; j < 8; j++) {
+    display_write(ssd1306_dev, 0, j * 8, &desc, &pixbuf[j*128]);
+    k_yield();
+  }
+}
+
+void ssd1306_thread_func() {
+  if (!device_is_ready(ssd1306_dev)) {
+    LOG_ERR("SSD1306 display device not ready");
+    return;
+  }
+  if (melspec_init(&mel, 1.0f, MAX_SAMPLE_RATE, mel_buf, sizeof(mel_buf) / sizeof(float32_t))) {
+    LOG_ERR("Failed to initialize mel spectrogram");
+    return;
+  }
+  // clear
+  uint8_t blank_pixels[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+  struct display_buffer_descriptor blank_desc = {
+    .buf_size = sizeof(blank_pixels),
+    .width = 8,
+    .height = 8,
+    .pitch = 8,
+  };
+  for (int j = 0; j < 8; j++) {
+    for (int i = 0; i < 16; i++) {
+      display_write(ssd1306_dev, i * 8, j * 8, &blank_desc, blank_pixels);
+    }
+  }
+  // draw
+  int bars[32] = {0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,
+                  32,34,36,38,40,42,44,46,48,50,52,54,56,58,60,62};
+  while (true) {
+    k_sem_take(&audio_process_sem, K_FOREVER);
+    if (melspec_get_size(&mel) < 1024) {
+      continue;
+    }
+    LOG_DBG("Generating new mel spectrogram");
+    k_mutex_lock(&audio_mel_mutex, K_FOREVER);
+    melspec_process(&mel);
+    melspec_shift(&mel, 1024); // 40ms
+    float32_t* spectrum = melspec_get_mel_spectrum(&mel);
+    float32_t max_spec;
+    float32_t min_spec;
+    size_t _idx;
+    arm_max_f32(spectrum, 32, &max_spec, &_idx);
+    arm_min_f32(spectrum, 32, &min_spec, &_idx);
+    LOG_DBG("Mel spectrum min: %f, max: %f", (double)min_spec, (double)max_spec);
+    for (int i = 0; i < 32; i++) {
+      // scale to 0-64
+      bars[i] = (int)(spectrum[i]);
+      if (bars[i] > 64) {
+        bars[i] = 64;
+      }
+      if (bars[i] < 0) {
+        bars[i] = 0;
+      }
+    }
+    k_mutex_unlock(&audio_mel_mutex);
+    render(mel_pixbuf, bars);
+    draw(mel_pixbuf);
+  }
+}
+
+K_THREAD_DEFINE(ssd1306_thread, 4096, ssd1306_thread_func, NULL, NULL, NULL,
+                    K_PRIO_PREEMPT(13), 0, 0);
 
 int init_dmic(const struct device *const dev) {
     int ret = 0;
@@ -170,7 +307,7 @@ void send_audio_data(const struct device *dev);
 
 static const struct usb_audio_ops mic_ops = {
     .data_request_cb = send_audio_data,
-	.feature_update_cb = feature_update,
+    .feature_update_cb = feature_update,
 };
 
 int init_usb_audio_mic(const struct device *const dev) {
@@ -182,32 +319,6 @@ int init_usb_audio_mic(const struct device *const dev) {
     usb_audio_register(usb_audio_mic, &mic_ops);
 
     LOG_INF("USB audio microphone initialized successfully");
-    return 0;
-}
-
-int main() {
-    LOG_INF("nrf USB MIC!");
-    int ret;
-
-    ret = init_dmic(dmic_dev);
-    if (ret < 0) {
-        LOG_ERR("Failed to initialize DMIC: %d", ret);
-        return ret;
-    }
-
-    ret = init_usb_audio_mic(usb_audio_mic);
-    if (ret < 0) {
-        LOG_ERR("Failed to initialize USB audio mic: %d", ret);
-        return ret;
-    }
-
-    ret = usb_enable(NULL);
-    if (ret != 0) {
-        LOG_ERR("Failed to enable USB: %d", ret);
-        return ret;
-    }
-
-    LOG_INF("Initialization completed");
     return 0;
 }
 
@@ -254,4 +365,30 @@ void stats_buffer(void *buffer, size_t len, int16_t *min, int16_t *max, int16_t 
     arm_max_q15(p, n, max, &_idx);
     arm_min_q15(p, n, min, &_idx);
     arm_mean_q15(p, n, avg);
+}
+
+int main() {
+    LOG_INF("nrf USB MIC!");
+    int ret;
+
+    ret = init_dmic(dmic_dev);
+    if (ret < 0) {
+        LOG_ERR("Failed to initialize DMIC: %d", ret);
+        return ret;
+    }
+
+    ret = init_usb_audio_mic(usb_audio_mic);
+    if (ret < 0) {
+        LOG_ERR("Failed to initialize USB audio mic: %d", ret);
+        return ret;
+    }
+
+    ret = usb_enable(NULL);
+    if (ret != 0) {
+        LOG_ERR("Failed to enable USB: %d", ret);
+        return ret;
+    }
+
+    LOG_INF("Initialization completed");
+    return 0;
 }
