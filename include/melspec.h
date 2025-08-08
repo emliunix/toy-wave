@@ -5,7 +5,7 @@
 #include <dsp/transform_functions.h>
 
 #define MELSPEC_MEL_SIZE 32
-#define MELSPEC_FFT_SIZE 1024
+#define MELSPEC_FFT_SIZE 512
 
 typedef struct melspec {
   float32_t gain;
